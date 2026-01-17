@@ -45,21 +45,21 @@ class LivoxLaserToPointcloud(Node):
         self.sub_imu = self.create_subscription(Imu, "/livox/inverted_imu", self.imu_callback, qos_profile=qos_profile)
 
     def pointcloud2_callback(self, msg: PointCloud2):
-            # 1. Map the buffer to our structure (Zero-copy view)
-            # We use frombuffer to interpret the raw bytes using our dtype
-            data = np.frombuffer(msg.data, dtype=self.LIVOX_DTYPE).copy()
+        # 1. Map the buffer to our structure (Zero-copy view)
+        # We use frombuffer to interpret the raw bytes using our dtype
+        data = np.frombuffer(msg.data, dtype=self.LIVOX_DTYPE).copy()
 
-            # 2. Modify spatial coordinates
-            # These operations are vectorized and extremely fast
-            data['y'] = -data['y']
-            data['z'] = -data['z']
+        # 2. Modify spatial coordinates
+        # These operations are vectorized and extremely fast
+        data['y'] = -data['y']
+        data['z'] = -data['z']
 
-            # 3. Reconstruct message
-            # We copy the original message to keep all metadata (header, fields, etc.)
-            out_msg = msg 
-            out_msg.data = data.tobytes()
-            
-            self.pub_scan.publish(out_msg)
+        # 3. Reconstruct message
+        # We copy the original message to keep all metadata (header, fields, etc.)
+        out_msg = msg 
+        out_msg.data = data.tobytes()
+        
+        self.pub_scan.publish(out_msg)
 
     def custom_msg_callback(self, msg: CustomMsg):
         for p in msg.points:
