@@ -1,17 +1,10 @@
 #!/usr/bin/env python3
-
-import copy
 import rclpy
 from rclpy.node import Node
-import rclpy.parameter
-import rclpy.parameter_service
 from sensor_msgs.msg import PointCloud2, Imu
 from livox_ros_driver2.msg import CustomMsg
-import ros2_numpy
-# from rcl_interfaces.srv import GetParameters
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import PointCloud2
-import sensor_msgs_py.point_cloud2 as pc2
 import numpy as np
 
 qos_profile = QoSProfile(
