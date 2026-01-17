@@ -4,7 +4,6 @@ from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2, Imu
 from livox_ros_driver2.msg import CustomMsg
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from sensor_msgs.msg import PointCloud2
 import numpy as np
 
 qos_profile = QoSProfile(
