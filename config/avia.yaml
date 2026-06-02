@@ -22,8 +22,8 @@
             blind: 4.0
 
         mapping:
-            acc_cov: 0.1
-            gyr_cov: 0.1
+            acc_cov: 0.05
+            gyr_cov: 0.05
             b_acc_cov: 0.0001
             b_gyr_cov: 0.0001
             fov_degree:    90.0

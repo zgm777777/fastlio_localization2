@@ -59,7 +59,7 @@ def generate_launch_description():
                      "scan_voxel_size": 0.1,
                      "freq_localization": 0.5,
                      "freq_global_map": 0.25,
-                     "localization_threshold": 0.8,
+                     "localization_threshold": 0.9,
                      "fov": 6.28319,
                      "fov_far": 300,
                      "pcd_map_path": pcd_map_path,
@@ -89,6 +89,16 @@ def generate_launch_description():
         ]
     )
 
+    # Static TF: body -> base_link
+    # LiDAR (body) is mounted 0.33m in front of the vehicle center, tilted forward 30° (pitch = -π/6)
+    static_tf_body_to_baselink = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="static_tf_body_to_baselink",
+        arguments=["-0.33", "0", "0", "0", "0", "0", "body", "base_link"],
+        output="screen",
+    )
+
     rviz_node = Node(package="rviz2", executable="rviz2", arguments=["-d", rviz_cfg], condition=IfCondition(rviz_use))
 
     ld = LaunchDescription()
@@ -105,5 +115,6 @@ def generate_launch_description():
     ld.add_action(global_localization_node)
     ld.add_action(transform_fusion_node)
     ld.add_action(pcd_publisher_node)
+    ld.add_action(static_tf_body_to_baselink)
 
     return ld

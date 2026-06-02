@@ -82,14 +82,33 @@ class FastLIOLocalization(Node):
         pc_array = ros2_numpy.numpify(pc_msg)
         return pc_array["xyz"]
     
-    def registration_at_scale(self, scan, map, initial, scale):
+    def registration_at_scale(self, scan, map, initial, scale, use_point_to_plane=False):
+        scan_down = self.voxel_down_sample(scan, self.get_parameter("scan_voxel_size").value * scale)
+        map_down = self.voxel_down_sample(map, self.get_parameter("map_voxel_size").value * scale)
+
+        # 精配准阶段可选 point-to-plane（仅在初始对齐时使用，持续跟踪用 point-to-point 省CPU）
+        if use_point_to_plane and len(scan_down.points) > 100:
+            try:
+                map_down.estimate_normals(
+                    o3d.geometry.KDTreeSearchParamHybrid(radius=1.0 * scale, max_nn=30)
+                )
+                result_icp = o3d.pipelines.registration.registration_icp(
+                    scan_down, map_down,
+                    1.0 * scale,
+                    initial,
+                    o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                    o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=20),
+                )
+                return result_icp.transformation, result_icp.fitness
+            except Exception:
+                pass  # fall through to point-to-point
+
         result_icp = o3d.pipelines.registration.registration_icp(
-        self.voxel_down_sample(scan, self.get_parameter("scan_voxel_size").value * scale),
-        self.voxel_down_sample(map, self.get_parameter("map_voxel_size").value * scale),
-        1.0 * scale,
-        initial,
-        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=20),
+            scan_down, map_down,
+            1.0 * scale,
+            initial,
+            o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=20),
         )
         return result_icp.transformation, result_icp.fitness
             
@@ -118,48 +137,153 @@ class FastLIOLocalization(Node):
             
         publisher.publish(msg)
         
-    def crop_global_map_in_FOV(self, pose_estimation):
-        T_odom_to_base_link = self.pose_to_mat(self.cur_odom.pose.pose)
-        T_map_to_base_link = np.matmul(pose_estimation, T_odom_to_base_link)
+    def crop_global_map_in_FOV(self, pose_estimation, margin_factor=1.5):
+        """根据估计位姿裁剪全局地图的FOV区域。
+        
+        Args:
+            pose_estimation: map->odom 变换矩阵
+            margin_factor: FOV扩展系数，>1表示扩大裁剪范围以容忍位姿误差
+        """
+        if self.cur_odom is None:
+            # 没有里程计时，直接用位姿估计作为 map->base_link
+            T_map_to_base_link = pose_estimation
+        else:
+            T_odom_to_base_link = self.pose_to_mat(self.cur_odom.pose.pose)
+            T_map_to_base_link = np.matmul(pose_estimation, T_odom_to_base_link)
         T_base_link_to_map = self.inverse_se3(T_map_to_base_link)
 
         global_map_in_map = np.array(self.global_map.points)
         global_map_in_map = np.column_stack([global_map_in_map, np.ones(len(global_map_in_map))])
         global_map_in_base_link = np.matmul(T_base_link_to_map, global_map_in_map.T).T
 
-        if self.get_parameter("fov").value > 3.14:
+        fov = self.get_parameter("fov").value
+        fov_far = self.get_parameter("fov_far").value * margin_factor
+
+        # 扩大FOV范围以容忍初始位姿误差
+        half_fov = fov / 2.0 * margin_factor
+
+        if fov > 3.14:
+            # 360度FOV：按距离裁剪
             indices = np.where(
-                (global_map_in_base_link[:, 0] < self.get_parameter("fov_far").value)
-                & (np.abs(np.arctan2(global_map_in_base_link[:, 1], global_map_in_base_link[:, 0])) < self.get_parameter("fov").value / 2.0)
+                (global_map_in_base_link[:, 0] < fov_far)
+                & (np.abs(np.arctan2(global_map_in_base_link[:, 1], global_map_in_base_link[:, 0])) < half_fov)
             )
         else:
-            indices = np.where(
-                (global_map_in_base_link[:, 0] > 0)
-                & (global_map_in_base_link[:, 0] < self.get_parameter("fov_far").value)
-                & (np.abs(np.arctan2(global_map_in_base_link[:, 1], global_map_in_base_link[:, 0])) < self.get_parameter("fov").value / 2.0)
+            # 前向FOV：同时用距离+距离兜底（不留空）
+            dist = np.sqrt(
+                global_map_in_base_link[:, 0]**2
+                + global_map_in_base_link[:, 1]**2
+                + global_map_in_base_link[:, 2]**2
             )
+            indices = np.where(
+                (global_map_in_base_link[:, 0] > -1.0)  # 允许后方1m（容忍误差）
+                & (dist < fov_far)
+                & (np.abs(np.arctan2(global_map_in_base_link[:, 1], global_map_in_base_link[:, 0])) < half_fov)
+            )
+        # 最小点数保护：点太少就用距离裁剪兜底
+        if len(indices[0]) < 200:
+            dist = np.sqrt(
+                global_map_in_base_link[:, 0]**2
+                + global_map_in_base_link[:, 1]**2
+                + global_map_in_base_link[:, 2]**2
+            )
+            indices = np.where(dist < fov_far)
+
         global_map_in_FOV = o3d.geometry.PointCloud()
         global_map_in_FOV.points = o3d.utility.Vector3dVector(np.squeeze(global_map_in_map[indices, :3]))
 
-        header = self.cur_odom.header
+        if self.cur_odom is not None:
+            header = self.cur_odom.header
+        else:
+            header = Header()
+            header.stamp = self.get_clock().now().to_msg()
         header.frame_id = "map"
         self.publish_point_cloud(self.pub_submap, header, np.array(global_map_in_FOV.points)[::10])
 
         return global_map_in_FOV
 
-    def global_localization(self, pose_estimation):
-        scan_tobe_mapped = copy.copy(self.cur_scan)
-        global_map_in_FOV = self.crop_global_map_in_FOV(pose_estimation)
-        
-        transformation, _ = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=pose_estimation, scale=5)
-        
-        transformation, fitness = self.registration_at_scale(scan_tobe_mapped, global_map_in_FOV, initial=pose_estimation, scale=1)
-        
-        if fitness > self.get_parameter("localization_threshold").value:
-            self.T_map_to_odom = transformation
-            self.publish_odom(transformation)
+    def generate_initial_hypotheses(self, base_pose, num_samples=8, trans_std=1.0, yaw_std=0.3):
+        """在初始位姿附近采样多个假设，提高ICP收敛成功率"""
+        hypotheses = [base_pose]  # 始终包含原始位姿
+        np.random.seed(42)  # 固定种子保证可重复
+        for _ in range(num_samples):
+            T = base_pose.copy()
+            # 随机平移扰动
+            T[0, 3] += np.random.normal(0, trans_std)
+            T[1, 3] += np.random.normal(0, trans_std)
+            T[2, 3] += np.random.normal(0, trans_std * 0.3)  # z轴扰动小一些
+            # 随机偏航角扰动
+            yaw = np.random.normal(0, yaw_std)
+            cos_y, sin_y = np.cos(yaw), np.sin(yaw)
+            R_yaw = np.array([
+                [cos_y, -sin_y, 0],
+                [sin_y,  cos_y, 0],
+                [0,       0,     1]
+            ])
+            T[:3, :3] = R_yaw @ base_pose[:3, :3]
+            hypotheses.append(T)
+        return hypotheses
+
+    def initial_alignment(self, initial_pose):
+        """首次初始对齐：多假设搜索 + 3级级联ICP + point-to-plane，一次性的高CPU开销"""
+        self.get_logger().info("Starting initial alignment with multi-hypothesis search...")
+
+        # 合并最近几帧扫描构建子图（比单帧更鲁棒）
+        if hasattr(self, 'scan_buffer') and len(self.scan_buffer) > 1:
+            merged_scan = o3d.geometry.PointCloud()
+            for s in self.scan_buffer:
+                merged_scan += s
+            scan = merged_scan
+            self.get_logger().info(f"Merged {len(self.scan_buffer)} scans: {len(merged_scan.points)} pts")
         else:
-            self.get_logger().warn(f"Fitness score {fitness} less than localization threshold {self.get_parameter('localization_threshold').value}")
+            scan = copy.copy(self.cur_scan)
+
+        # 多假设：原始位姿 + 4 个扰动（平移±1m，偏航±15°）
+        hypotheses = self.generate_initial_hypotheses(initial_pose, num_samples=4)
+
+        best_transformation = initial_pose
+        best_fitness = 0.0
+
+        for idx, hypothesis in enumerate(hypotheses):
+            global_map_in_FOV = self.crop_global_map_in_FOV(hypothesis)
+            if len(global_map_in_FOV.points) < 100:
+                continue
+
+            # Stage 1: 粗配准 (scale=5, point-to-point)
+            T_coarse, _ = self.registration_at_scale(
+                scan, global_map_in_FOV, initial=hypothesis, scale=5
+            )
+            # Stage 2: 中配准 (scale=2, point-to-point, 用粗结果初始化)
+            T_medium, _ = self.registration_at_scale(
+                scan, global_map_in_FOV, initial=T_coarse, scale=2
+            )
+            # Stage 3: 精配准 (scale=1, point-to-plane, 用中结果初始化)
+            T_fine, fitness = self.registration_at_scale(
+                scan, global_map_in_FOV, initial=T_medium,
+                scale=1, use_point_to_plane=True
+            )
+
+            self.get_logger().info(f"  hypothesis {idx}: fitness={fitness:.4f}")
+
+            if fitness > best_fitness:
+                best_fitness = fitness
+                best_transformation = T_fine
+
+            if best_fitness > 0.95:  # 足够好，提前结束
+                break
+
+        self.get_logger().info(f"Initial alignment done. Best fitness: {best_fitness:.4f}")
+
+        threshold = self.get_parameter("localization_threshold").value
+        if best_fitness > threshold:
+            self.T_map_to_odom = best_transformation
+            self.publish_odom(best_transformation)
+            self.initialized = True
+            self.get_logger().info("Initial alignment SUCCESS.")
+        else:
+            self.get_logger().warn(
+                f"Initial alignment FAILED: best fitness {best_fitness:.4f} < threshold {threshold}"
+            )
 
     def voxel_down_sample(self, pcd, voxel_size):
         # print(pcd)
@@ -182,6 +306,13 @@ class FastLIOLocalization(Node):
         self.cur_scan.points = o3d.utility.Vector3dVector(pc)
         self.publish_point_cloud(self.pub_pc_in_map, msg.header, pc)
         
+        # 累积局部子图：保留最近3帧用于初始对齐（仅首次对齐时使用）
+        if not hasattr(self, 'scan_buffer'):
+            self.scan_buffer = []
+        self.scan_buffer.append(copy.copy(self.cur_scan))
+        if len(self.scan_buffer) > 3:
+            self.scan_buffer.pop(0)
+        
     def initialize_global_map(self): #, pc_msg):
         # self.global_map = o3d.geometry.PointCloud()
         # self.global_map.points = o3d.utility.Vector3dVector(self.msg_to_array(pc_msg)[:, :3])
@@ -192,11 +323,12 @@ class FastLIOLocalization(Node):
 
     def cb_initialize_pose(self, msg):
         initial_pose = self.pose_to_mat(msg.pose.pose)
-        self.initialized = True
-        self.get_logger().info("Initial pose received.")
+        self.get_logger().info("Initial pose received, starting alignment...")
         
         if self.cur_scan is not None:
-            self.global_localization(initial_pose)
+            self.initial_alignment(initial_pose)
+        else:
+            self.get_logger().warn("No scan received yet, cannot align")
             
     def publish_odom(self, transform):
         odom_msg = Odometry()
@@ -211,12 +343,33 @@ class FastLIOLocalization(Node):
         self.pub_map_to_odom.publish(odom_msg)
 
     def localisation_timer_callback(self):
+        """持续跟踪：轻量级 ICP，低 CPU 开销"""
         if not self.initialized:
-            self.get_logger().info("Waiting for initial pose...")
+            self.get_logger().info("Waiting for initial pose...", throttle_duration_sec=5.0)
             return
         
-        if self.cur_scan is not None:
-            self.global_localization(self.T_map_to_odom)
+        if self.cur_scan is None:
+            return
+
+        # 用当前 scan（不做多帧合并，省 CPU）
+        scan = copy.copy(self.cur_scan)
+
+        # 2 级级联 ICP：coarse(scale=3) → fine(scale=1)，均 point-to-point
+        try:
+            global_map_in_FOV = self.crop_global_map_in_FOV(self.T_map_to_odom)
+
+            T_coarse, _ = self.registration_at_scale(
+                scan, global_map_in_FOV, initial=self.T_map_to_odom, scale=3
+            )
+            T_fine, fitness = self.registration_at_scale(
+                scan, global_map_in_FOV, initial=T_coarse, scale=1
+            )
+
+            if fitness > self.get_parameter("localization_threshold").value:
+                self.T_map_to_odom = T_fine
+                self.publish_odom(T_fine)
+        except Exception as e:
+            self.get_logger().warn(f"Tracking ICP failed: {e}")
 
 
 def main(args=None):
